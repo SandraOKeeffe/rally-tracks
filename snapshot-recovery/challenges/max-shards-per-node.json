@@ -1,0 +1,25 @@
+{
+  "name": "max-shards-per-node",
+  "description": "SKELETON: restore enough shards to reach the per-node shard limit",
+  "default": false,
+  "schedule": [
+    {
+      "name": "preflight",
+      "operation": {
+        "operation-type": "data-recovery-preflight"
+      }
+    },
+    {
+      "name": "wait-for-recovery-point",
+      "operation": {
+        "operation-type": "wait-for-recovery-point"
+      }
+    },
+    {
+      "name": "restore-recovery",
+      "operation": {
+        "operation-type": "restore-recovery"
+      }
+    }
+  ]
+}

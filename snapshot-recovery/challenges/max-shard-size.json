@@ -1,0 +1,25 @@
+{
+  "name": "max-shard-size",
+  "description": "SKELETON: restore a source whose shards are at the platform maximum shard size",
+  "default": false,
+  "schedule": [
+    {
+      "name": "preflight",
+      "operation": {
+        "operation-type": "data-recovery-preflight"
+      }
+    },
+    {
+      "name": "wait-for-recovery-point",
+      "operation": {
+        "operation-type": "wait-for-recovery-point"
+      }
+    },
+    {
+      "name": "restore-recovery",
+      "operation": {
+        "operation-type": "restore-recovery"
+      }
+    }
+  ]
+}

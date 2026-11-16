@@ -1,0 +1,62 @@
+{
+  "name": "restore-baseline",
+  "description": "Index a small source index, obtain a recovery point, restore it with mode rename and verify the restored doc count",
+  "default": true,
+  "schedule": [
+    {
+      "name": "preflight",
+      "operation": {
+        "operation-type": "data-recovery-preflight"
+      }
+    },
+    {
+      "name": "index-source-docs",
+      "operation": {
+        "operation-type": "index-source-docs",
+        "index": "{{ source_index | default('recovery-source') }}",
+        "doc_count": {{ doc_count | default(100) }},
+        "bulk_size": {{ bulk_size | default(1000) }},
+        "validate_restore": {{ validate_restore | default(true) | tojson }}
+      }
+    },
+    {
+      "name": "wait-for-recovery-point",
+      "operation": {
+        "operation-type": "wait-for-recovery-point",
+        "recovery_point_mode": "{{ recovery_point_mode | default('wait') }}",
+        "recovery_repo": "{{ recovery_repo | default('data-recovery') }}",
+        "timeout_secs": {{ recovery_point_timeout_secs | default(2400) }},
+        "poll_interval_secs": {{ poll_interval_secs | default(10) }}
+      }
+    },
+    {
+      "name": "restore-recovery",
+      "operation": {
+        "operation-type": "restore-recovery",
+        "restore_prefix": "{{ restore_prefix | default('rally-restore-') }}",
+        "timeout_secs": {{ recovery_timeout_secs | default(600) }},
+        "poll_interval_secs": {{ restore_poll_interval_secs | default(2) }},
+        "use_status_api": {{ use_status_api | default(false) | tojson }}
+      }
+    }
+    {#- validate-restore and cleanup-recovery are left out when switched off: Rally fails a task whose runner makes no Elasticsearch request. -#}
+    {% if validate_restore | default(true) -%}
+    ,
+    {
+      "name": "validate-restore",
+      "operation": {
+        "operation-type": "validate-restore"
+      }
+    }
+    {%- endif %}
+    {% if cleanup | default(true) -%}
+    ,
+    {
+      "name": "cleanup-recovery",
+      "operation": {
+        "operation-type": "cleanup-recovery"
+      }
+    }
+    {%- endif %}
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "name": "max-concurrent-restores",
+  "description": "SKELETON: run restores in parallel up to the platform concurrent-restore limit",
+  "default": false,
+  "schedule": [
+    {
+      "name": "preflight",
+      "operation": {
+        "operation-type": "data-recovery-preflight"
+      }
+    },
+    {
+      "name": "wait-for-recovery-point",
+      "operation": {
+        "operation-type": "wait-for-recovery-point"
+      }
+    },
+    {
+      "name": "restore-recovery",
+      "operation": {
+        "operation-type": "restore-recovery"
+      }
+    }
+  ]
+}

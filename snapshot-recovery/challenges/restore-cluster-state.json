@@ -1,0 +1,19 @@
+{
+  "name": "restore-cluster-state",
+  "description": "SKELETON: stepped restore (step_size, max_sources); per step compare cluster state growth for a restore against creating equivalent indices directly",
+  "default": false,
+  "schedule": [
+    {
+      "name": "preflight",
+      "operation": {
+        "operation-type": "data-recovery-preflight"
+      }
+    },
+    {
+      "name": "measure-cluster-state-baseline",
+      "operation": {
+        "operation-type": "measure-cluster-state"
+      }
+    }
+  ]
+}
