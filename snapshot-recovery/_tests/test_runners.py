@@ -31,9 +31,15 @@ _spec.loader.exec_module(track)
 
 
 class FakeApiError(Exception):
-    def __init__(self, status_code):
-        super().__init__(f"HTTP {status_code}")
+    def __init__(self, status_code, message=None):
+        super().__init__(message or f"HTTP {status_code}")
         self.status_code = status_code
+
+
+RESTORING_MESSAGE = (
+    "search_phase_execution_exception ({'error': {'root_cause': [{'type': 'shard_restoring_exception', "
+    "'reason': 'index [x] is currently being restored from a snapshot and is temporarily unavailable'}]}, 'status': 403})"
+)
 
 
 class FakeResponse:
@@ -205,6 +211,34 @@ async def test_restore_recovery_starts_restore_retries_transient_errors_and_repo
     assert result["restored_primary_shards"] == 2
     assert result["restore_duration_secs"] >= 0
     assert result["recovery_point_wait_secs"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_restore_recovery_retries_403_shard_restoring_exception():
+    _set_recovery_point()
+    errors = [FakeApiError(403, RESTORING_MESSAGE), FakeApiError(403, RESTORING_MESSAGE)]
+
+    def other(method, path, params, body):
+        if path.endswith("/_count"):
+            if errors:
+                raise errors.pop(0)
+            return {"count": 3}
+        return [{"prirep": "p"}]
+
+    result = await track.RestoreRecovery()(FakeEs(_restore_handler(other)), {"timeout_secs": 100, "poll_interval_secs": 0})
+    assert result["restored_docs"] == 3
+    assert errors == []
+
+
+@pytest.mark.asyncio
+async def test_restore_recovery_does_not_retry_other_403_errors():
+    _set_recovery_point()
+
+    def other(method, path, params, body):
+        raise FakeApiError(403, "security_exception: action is unauthorized")
+
+    with pytest.raises(FakeApiError):
+        await track.RestoreRecovery()(FakeEs(_restore_handler(other)), {"timeout_secs": 100, "poll_interval_secs": 0})
 
 
 @pytest.mark.asyncio

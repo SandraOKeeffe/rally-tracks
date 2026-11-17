@@ -53,6 +53,15 @@ def _status(exc):
     return getattr(exc, "status_code", None) or getattr(exc, "status", None)
 
 
+def _is_not_ready(exc):
+    """True while a restored index is still being created / allocated.
+
+    That is a 404 or 503, or a 403 ``shard_restoring_exception`` ("currently being restored from a
+    snapshot and is temporarily unavailable"). Other 403s are real permission errors and are not retried.
+    """
+    return _status(exc) in TRANSIENT_STATUSES or "shard_restoring_exception" in str(exc)
+
+
 def _parse_ts(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
@@ -342,7 +351,7 @@ class RestoreRecovery(_Runner):
             try:
                 last = await client.count(STATE.destination)
             except Exception as e:
-                if _status(e) not in TRANSIENT_STATUSES:
+                if not _is_not_ready(e):
                     raise
             else:
                 if last == STATE.expected_docs:
