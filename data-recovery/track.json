@@ -1,0 +1,8 @@
+{% import "rally.helpers" as rally with context -%}
+{
+  "version": 2,
+  "description": "Benchmarks Serverless data recovery restores: restores a small index with the _data_recovery APIs and validates the restored index against the source. Track params and their defaults are documented in README.md and defined in challenges/restore-baseline.json.",
+  "challenges": [
+    {{ rally.collect(parts="challenges/*.json") }}
+  ]
+}

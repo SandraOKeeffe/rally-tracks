@@ -19,13 +19,15 @@ import importlib.util
 import pathlib
 from datetime import datetime, timedelta, timezone
 
+import elasticsearch
 import pytest
+from elastic_transport import ApiResponseMeta, HttpHeaders, NodeConfig
 
 TRACK_DIR = pathlib.Path(__file__).parents[1]
 
 # Import the track module under a unique name to avoid colliding with other
 # tracks' track.py modules when the whole repo's tests are collected together.
-_spec = importlib.util.spec_from_file_location("snapshot_recovery_track", TRACK_DIR / "track.py")
+_spec = importlib.util.spec_from_file_location("data_recovery_track", TRACK_DIR / "track.py")
 track = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(track)
 
@@ -36,10 +38,64 @@ class FakeApiError(Exception):
         self.status_code = status_code
 
 
-RESTORING_MESSAGE = (
-    "search_phase_execution_exception ({'error': {'root_cause': [{'type': 'shard_restoring_exception', "
-    "'reason': 'index [x] is currently being restored from a snapshot and is temporarily unavailable'}]}, 'status': 403})"
-)
+def api_error(status, body, message="search_phase_execution_exception"):
+    """A real elasticsearch.ApiError, so str() and .body behave like the ones Rally's client raises."""
+    meta = ApiResponseMeta(
+        status=status, http_version="1.1", headers=HttpHeaders(), duration=0.0, node=NodeConfig("http", "localhost", 9200)
+    )
+    return elasticsearch.ApiError(message, meta, body)
+
+
+_RESTORING_REASON = "index [x] is currently being restored from a snapshot and is temporarily unavailable"
+# The error body a count on a restoring index returns (shape taken from a real QA run).
+RESTORING_BODY = {
+    "error": {
+        "root_cause": [
+            {"type": "shard_restoring_exception", "reason": _RESTORING_REASON, "index": "x", "recovery_id": "recovery-v1-default-abc"}
+        ],
+        "type": "search_phase_execution_exception",
+        "reason": "all shards failed",
+        "phase": "query",
+        "grouped": True,
+        "failed_shards": [
+            {"shard": 0, "index": "x", "node": None, "reason": {"type": "shard_restoring_exception", "reason": _RESTORING_REASON}}
+        ],
+    },
+    "status": 403,
+}
+SECURITY_BODY = {
+    "error": {
+        "root_cause": [{"type": "security_exception", "reason": "action is unauthorized"}],
+        "type": "security_exception",
+        "reason": "action is unauthorized",
+    },
+    "status": 403,
+}
+
+
+def test_str_of_a_real_api_error_does_not_contain_the_restoring_exception_type():
+    # This is why the type must be read from the body: matching it in str(exc) never works.
+    assert "shard_restoring_exception" not in str(api_error(403, RESTORING_BODY))
+
+
+def test_is_not_ready_for_a_real_restoring_api_error():
+    assert track._is_not_ready(api_error(403, RESTORING_BODY))
+
+
+def test_is_not_ready_when_only_the_failed_shard_names_the_type():
+    body = {"error": {"root_cause": [], "failed_shards": RESTORING_BODY["error"]["failed_shards"]}}
+    assert track._is_not_ready(api_error(403, body))
+
+
+def test_is_not_ready_for_404_and_503():
+    assert track._is_not_ready(FakeApiError(404))
+    assert track._is_not_ready(FakeApiError(503))
+
+
+def test_is_not_ready_is_false_for_other_403s_and_other_errors():
+    assert not track._is_not_ready(api_error(403, SECURITY_BODY))
+    assert not track._is_not_ready(FakeApiError(500))
+    assert not track._is_not_ready(ValueError("boom"))
 
 
 class FakeResponse:
@@ -86,6 +142,12 @@ def _set_indexed(index="src", docs=3, at=0):
     track.STATE.indexed_at = datetime(2026, 11, 13, 12, 0, 0, tzinfo=timezone.utc) + timedelta(seconds=at)
 
 
+# The runners require every param (the challenge definition is the single source of defaults).
+INDEX_PARAMS = {"index": "src", "doc_count": 5, "bulk_size": 1000, "validate_restore": True}
+WAIT_PARAMS = {"recovery_point_mode": "wait", "recovery_repo": "data-recovery", "timeout_secs": 100, "poll_interval_secs": 0}
+RESTORE_PARAMS = {"restore_prefix": "rally-restore-", "timeout_secs": 100, "poll_interval_secs": 0, "use_status_api": False}
+
+
 @pytest.mark.asyncio
 async def test_client_unwraps_plain_dict_and_api_response():
     plain = track.DataRecoveryClient(FakeEs(lambda *a: {"recovery_points": [1]}))
@@ -113,6 +175,24 @@ async def test_start_recovery_request_body():
 
 
 @pytest.mark.asyncio
+async def test_list_sources_request():
+    es = FakeEs(lambda *a: {"sources": []})
+    result = await track.DataRecoveryClient(es).list_sources("2026-11-13T12:00:01.000Z", "src")
+    assert es.calls == [
+        ("GET", "/_data_recovery/sources", {"expression": "src", "recovery_point_end_time": "2026-11-13T12:00:01.000Z"}, None)
+    ]
+    assert result == {"sources": []}
+
+
+@pytest.mark.asyncio
+async def test_get_recovery_request():
+    es = FakeEs(lambda *a: {"status": "running"})
+    result = await track.DataRecoveryClient(es).get_recovery("id1")
+    assert es.calls == [("GET", "/_data_recovery/recoveries/id1", None, None)]
+    assert result == {"status": "running"}
+
+
+@pytest.mark.asyncio
 async def test_wait_for_recovery_point_skips_points_before_indexing_and_incomplete_sources():
     _set_indexed(at=10)
     state = {"polls": 0}
@@ -127,7 +207,7 @@ async def test_wait_for_recovery_point_skips_points_before_indexing_and_incomple
         complete = state["polls"] >= 3
         return {"sources": [{"name": "src", "type": "index", "complete": complete}]}
 
-    result = await track.WaitForRecoveryPoint()(FakeEs(handler), {"timeout_secs": 100, "poll_interval_secs": 0})
+    result = await track.WaitForRecoveryPoint()(FakeEs(handler), WAIT_PARAMS)
     assert result["recovery_point_end_time"] == _ts(21)
     assert track.STATE.recovery_point_end_time == _ts(21)
 
@@ -144,7 +224,7 @@ async def test_wait_for_recovery_point_snapshot_mode_creates_snapshot():
         return {"sources": [{"name": "src", "complete": True}]}
 
     es = FakeEs(handler)
-    result = await track.WaitForRecoveryPoint()(es, {"recovery_point_mode": "snapshot", "recovery_repo": "my-repo"})
+    result = await track.WaitForRecoveryPoint()(es, {**WAIT_PARAMS, "recovery_point_mode": "snapshot", "recovery_repo": "my-repo"})
     put = next(c for c in es.calls if c[0] == "PUT")
     assert put[1].startswith("/_snapshot/my-repo/rally-")
     assert put[3] == {"indices": "src", "include_global_state": False}
@@ -156,14 +236,24 @@ async def test_wait_for_recovery_point_times_out():
     _set_indexed(at=0)
     es = FakeEs(lambda *a: {"recovery_points": []})
     with pytest.raises(RuntimeError, match="no recovery point"):
-        await track.WaitForRecoveryPoint()(es, {"timeout_secs": -1, "poll_interval_secs": 0})
+        await track.WaitForRecoveryPoint()(es, {**WAIT_PARAMS, "timeout_secs": -1})
 
 
 @pytest.mark.asyncio
 async def test_wait_for_recovery_point_rejects_unknown_mode():
     _set_indexed()
     with pytest.raises(ValueError):
-        await track.WaitForRecoveryPoint()(FakeEs(lambda *a: {}), {"recovery_point_mode": "bogus"})
+        await track.WaitForRecoveryPoint()(FakeEs(lambda *a: {}), {**WAIT_PARAMS, "recovery_point_mode": "bogus"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repo", ["a/b", "a?b", "a,b", "*", "_all", ".x", "-x", "", "has space"])
+async def test_wait_for_recovery_point_refuses_unsafe_repository_names_without_calling_es(repo):
+    _set_indexed()
+    es = FakeEs(lambda *a: {})
+    with pytest.raises(ValueError, match="not a plain repository name"):
+        await track.WaitForRecoveryPoint()(es, {**WAIT_PARAMS, "recovery_point_mode": "snapshot", "recovery_repo": repo})
+    assert es.calls == []
 
 
 def _set_recovery_point():
@@ -197,7 +287,7 @@ async def test_restore_recovery_starts_restore_retries_transient_errors_and_repo
         return [{"prirep": "p"}, {"prirep": "r"}, {"prirep": "p"}]
 
     es = FakeEs(_restore_handler(other))
-    result = await track.RestoreRecovery()(es, {"restore_prefix": "rally-restore-", "timeout_secs": 100, "poll_interval_secs": 0})
+    result = await track.RestoreRecovery()(es, RESTORE_PARAMS)
 
     start = next(c for c in es.calls if c[0] == "POST")
     assert start[3]["recovery_point_end_time"] == _ts(21)
@@ -216,7 +306,7 @@ async def test_restore_recovery_starts_restore_retries_transient_errors_and_repo
 @pytest.mark.asyncio
 async def test_restore_recovery_retries_403_shard_restoring_exception():
     _set_recovery_point()
-    errors = [FakeApiError(403, RESTORING_MESSAGE), FakeApiError(403, RESTORING_MESSAGE)]
+    errors = [api_error(403, RESTORING_BODY), api_error(403, RESTORING_BODY)]
 
     def other(method, path, params, body):
         if path.endswith("/_count"):
@@ -225,7 +315,7 @@ async def test_restore_recovery_retries_403_shard_restoring_exception():
             return {"count": 3}
         return [{"prirep": "p"}]
 
-    result = await track.RestoreRecovery()(FakeEs(_restore_handler(other)), {"timeout_secs": 100, "poll_interval_secs": 0})
+    result = await track.RestoreRecovery()(FakeEs(_restore_handler(other)), RESTORE_PARAMS)
     assert result["restored_docs"] == 3
     assert errors == []
 
@@ -235,10 +325,10 @@ async def test_restore_recovery_does_not_retry_other_403_errors():
     _set_recovery_point()
 
     def other(method, path, params, body):
-        raise FakeApiError(403, "security_exception: action is unauthorized")
+        raise api_error(403, SECURITY_BODY, message="security_exception")
 
-    with pytest.raises(FakeApiError):
-        await track.RestoreRecovery()(FakeEs(_restore_handler(other)), {"timeout_secs": 100, "poll_interval_secs": 0})
+    with pytest.raises(elasticsearch.ApiError):
+        await track.RestoreRecovery()(FakeEs(_restore_handler(other)), RESTORE_PARAMS)
 
 
 @pytest.mark.asyncio
@@ -250,7 +340,7 @@ async def test_restore_recovery_reports_summary(monkeypatch):
     def other(method, path, params, body):
         return {"count": 3} if path.endswith("/_count") else [{"prirep": "p"}]
 
-    await track.RestoreRecovery()(FakeEs(_restore_handler(other)), {"poll_interval_secs": 0})
+    await track.RestoreRecovery()(FakeEs(_restore_handler(other)), RESTORE_PARAMS)
     assert len(reported) == 1
     assert "3/3 docs" in reported[0]
     assert "1 primary shards" in reported[0]
@@ -264,9 +354,9 @@ async def test_restore_recovery_uses_unique_prefix_per_run():
         return {"count": 3} if path.endswith("/_count") else [{"prirep": "p"}]
 
     runner = track.RestoreRecovery()
-    await runner(FakeEs(_restore_handler(other)), {"poll_interval_secs": 0})
+    await runner(FakeEs(_restore_handler(other)), RESTORE_PARAMS)
     first = track.STATE.destination
-    await runner(FakeEs(_restore_handler(other)), {"poll_interval_secs": 0})
+    await runner(FakeEs(_restore_handler(other)), RESTORE_PARAMS)
     assert track.STATE.destination != first
 
 
@@ -278,7 +368,7 @@ async def test_restore_recovery_fails_on_unexpected_error():
         raise FakeApiError(500)
 
     with pytest.raises(FakeApiError):
-        await track.RestoreRecovery()(FakeEs(_restore_handler(other)), {"timeout_secs": 100, "poll_interval_secs": 0})
+        await track.RestoreRecovery()(FakeEs(_restore_handler(other)), RESTORE_PARAMS)
 
 
 @pytest.mark.asyncio
@@ -289,7 +379,7 @@ async def test_restore_recovery_fails_on_doc_count_mismatch_after_timeout():
         return {"count": 1}
 
     with pytest.raises(RuntimeError, match="expected 3"):
-        await track.RestoreRecovery()(FakeEs(_restore_handler(other)), {"timeout_secs": -1, "poll_interval_secs": 0})
+        await track.RestoreRecovery()(FakeEs(_restore_handler(other)), {**RESTORE_PARAMS, "timeout_secs": -1})
 
 
 @pytest.mark.asyncio
@@ -300,7 +390,35 @@ async def test_restore_recovery_status_api_failed():
         return {"status": "failed"}
 
     with pytest.raises(RuntimeError, match="failed"):
-        await track.RestoreRecovery()(FakeEs(_restore_handler(other)), {"use_status_api": True})
+        await track.RestoreRecovery()(FakeEs(_restore_handler(other)), {**RESTORE_PARAMS, "use_status_api": True})
+
+
+@pytest.mark.asyncio
+async def test_restore_recovery_status_api_completed_then_waits_for_docs():
+    _set_recovery_point()
+    statuses = ["running", "running", "completed"]
+
+    def other(method, path, params, body):
+        if path.startswith("/_data_recovery/recoveries/"):
+            return {"status": statuses.pop(0)}
+        return {"count": 3} if path.endswith("/_count") else [{"prirep": "p"}]
+
+    es = FakeEs(_restore_handler(other))
+    result = await track.RestoreRecovery()(es, {**RESTORE_PARAMS, "use_status_api": True})
+    assert statuses == []
+    assert result["restored_docs"] == 3
+    assert ("GET", "/_data_recovery/recoveries/id1", None, None) in es.calls
+
+
+@pytest.mark.asyncio
+async def test_restore_recovery_status_api_times_out_while_still_running():
+    _set_recovery_point()
+
+    def other(method, path, params, body):
+        return {"status": "running"}
+
+    with pytest.raises(RuntimeError, match=r"still \[running\]"):
+        await track.RestoreRecovery()(FakeEs(_restore_handler(other)), {**RESTORE_PARAMS, "use_status_api": True, "timeout_secs": -1})
 
 
 @pytest.mark.asyncio
@@ -329,7 +447,7 @@ UNSAFE_NAMES = ["*", "recovery-*", "a,b", "_all", ".kibana", "-x", "+x", "", "ha
 async def test_index_source_docs_refuses_unsafe_index_names_without_calling_es(name):
     es = FakeEs(_index_handler())
     with pytest.raises(ValueError, match="not a plain index name"):
-        await track.IndexSourceDocs()(es, {"index": name, "doc_count": 5})
+        await track.IndexSourceDocs()(es, {**INDEX_PARAMS, "index": name})
     assert es.calls == []
 
 
@@ -341,6 +459,15 @@ async def test_cleanup_refuses_unsafe_names_without_deleting(name):
     es = FakeEs(lambda *a: {})
     with pytest.raises(ValueError, match="not a plain index name"):
         await track.CleanupRecovery()(es, {})
+    assert es.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", [{"doc_count": 0}, {"doc_count": -1}, {"bulk_size": 0}, {"bulk_size": -5}])
+async def test_index_source_docs_rejects_non_positive_counts_without_calling_es(override):
+    es = FakeEs(_index_handler())
+    with pytest.raises(ValueError, match="must be at least 1"):
+        await track.IndexSourceDocs()(es, {**INDEX_PARAMS, **override})
     assert es.calls == []
 
 
@@ -367,7 +494,7 @@ def _index_handler(count=5, checksum=10.0):
 @pytest.mark.asyncio
 async def test_index_source_docs_bulk_indexes_and_records_state():
     es = FakeEs(_index_handler(count=5, checksum=10.0))
-    result = await track.IndexSourceDocs()(es, {"index": "src", "doc_count": 5, "bulk_size": 2})
+    result = await track.IndexSourceDocs()(es, {**INDEX_PARAMS, "bulk_size": 2})
     bulks = [c for c in es.calls if c[1] == "/src/_bulk"]
     assert len(bulks) == 3
     assert result["weight"] == 5
@@ -380,13 +507,13 @@ async def test_index_source_docs_bulk_indexes_and_records_state():
 async def test_index_source_docs_fails_when_source_count_differs():
     es = FakeEs(_index_handler(count=4))
     with pytest.raises(RuntimeError, match="holds 4 docs after indexing, expected 5"):
-        await track.IndexSourceDocs()(es, {"index": "src", "doc_count": 5})
+        await track.IndexSourceDocs()(es, INDEX_PARAMS)
 
 
 @pytest.mark.asyncio
 async def test_index_source_docs_skips_checksum_when_validation_disabled():
     es = FakeEs(_index_handler(count=5))
-    await track.IndexSourceDocs()(es, {"index": "src", "doc_count": 5, "validate_restore": False})
+    await track.IndexSourceDocs()(es, {**INDEX_PARAMS, "validate_restore": False})
     assert track.STATE.expected_checksum is None
     assert not any(c[1].endswith("/_search") for c in es.calls)
 
@@ -436,7 +563,7 @@ async def test_restore_recovery_reports_not_queryable_distinctly():
         raise FakeApiError(503)
 
     with pytest.raises(RuntimeError, match="not queryable"):
-        await track.RestoreRecovery()(FakeEs(_restore_handler(other)), {"timeout_secs": -1, "poll_interval_secs": 0})
+        await track.RestoreRecovery()(FakeEs(_restore_handler(other)), {**RESTORE_PARAMS, "timeout_secs": -1})
 
 
 def test_register_registers_all_runners():
@@ -456,5 +583,45 @@ def test_register_registers_all_runners():
         "restore-recovery",
         "validate-restore",
         "cleanup-recovery",
-        "measure-cluster-state",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runner, base_params",
+    [
+        (track.IndexSourceDocs, INDEX_PARAMS),
+        (track.WaitForRecoveryPoint, WAIT_PARAMS),
+        (track.RestoreRecovery, RESTORE_PARAMS),
+    ],
+)
+async def test_runners_fail_clearly_when_a_required_param_is_missing(runner, base_params):
+    es = FakeEs(lambda *a: {})
+    for key in runner.required_params:
+        params = {k: v for k, v in base_params.items() if k != key}
+        with pytest.raises(KeyError, match="missing required param"):
+            await runner()(es, params)
+    assert es.calls == []
+
+
+def test_required_params_cover_every_param_the_runners_read():
+    assert set(INDEX_PARAMS) == set(track.IndexSourceDocs.required_params)
+    assert set(WAIT_PARAMS) == set(track.WaitForRecoveryPoint.required_params)
+    assert set(RESTORE_PARAMS) == set(track.RestoreRecovery.required_params)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runner, params",
+    [
+        (track.WaitForRecoveryPoint, WAIT_PARAMS),
+        (track.RestoreRecovery, RESTORE_PARAMS),
+        (track.ValidateRestore, {}),
+    ],
+)
+async def test_runners_fail_clearly_when_an_earlier_task_has_not_set_the_state(runner, params):
+    # STATE is empty (reset by the fixture), as when tasks run in different processes or out of order.
+    es = FakeEs(lambda *a: {})
+    with pytest.raises(RuntimeError, match="from an earlier task"):
+        await runner()(es, params)
+    assert es.calls == []

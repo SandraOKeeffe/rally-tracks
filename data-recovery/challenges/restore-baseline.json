@@ -1,6 +1,6 @@
 {
   "name": "restore-baseline",
-  "description": "Index a small source index, obtain a recovery point, restore it with mode rename and verify the restored doc count",
+  "description": "Index a small source index, obtain a recovery point, restore it with mode rename and validate the restored index against the source",
   "default": true,
   "schedule": [
     {

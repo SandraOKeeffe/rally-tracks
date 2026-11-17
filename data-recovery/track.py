@@ -17,12 +17,16 @@
 
 """Serverless data recovery restore track.
 
-MVP: the ``restore-baseline`` challenge indexes a small source index, obtains a recovery point
-(created via a snapshot locally, or waited for on a real deployment), restores it with
-``mode: rename`` and verifies the restored doc count. ``measure-cluster-state`` is still a stub.
+The ``restore-baseline`` challenge indexes a small source index, obtains a recovery point (created
+via a snapshot locally, or waited for on a real deployment), restores it with ``mode: rename`` and
+validates the restored index against the source.
+
+Defaults live in the challenge definition only: the runners require their params (see
+``required_params``) and fail with a clear message if one is missing.
 
 State is shared between the runners of a race through ``STATE``, so the track assumes a single
-client per operation (the default for the tasks in ``restore-baseline``).
+client per operation (the default for the tasks in ``restore-baseline``). A runner whose inputs
+were not set by an earlier task fails with a clear message.
 """
 
 import asyncio
@@ -40,6 +44,9 @@ logger = logging.getLogger(__name__)
 # Statuses returned while a restored index is still being created / allocated.
 TRANSIENT_STATUSES = (404, 503)
 
+# Numeric field of the generated docs; the sum of it is used as a cheap content checksum.
+CHECKSUM_FIELD = "n"
+
 
 def _unwrap(response):
     """Return the parsed JSON body of a response, whether it is an ApiResponse or a plain dict."""
@@ -53,13 +60,38 @@ def _status(exc):
     return getattr(exc, "status_code", None) or getattr(exc, "status", None)
 
 
+RESTORING_ERROR_TYPE = "shard_restoring_exception"
+
+
+def _is_restoring_error(exc):
+    """True if the error says the index is currently being restored from a snapshot.
+
+    The error type has to be read from the structured response body: ``str(ApiError)`` only contains
+    the root cause *reason*, never its *type*, so matching ``shard_restoring_exception`` in ``str(exc)``
+    never matches a real error. The reason text is checked as a fallback.
+    """
+    body = getattr(exc, "body", None)
+    if isinstance(body, (bytes, str)):
+        try:
+            body = json.loads(body)
+        except ValueError:
+            body = None
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        causes = [error, *(error.get("root_cause") or [])]
+        causes += [failed.get("reason") for failed in error.get("failed_shards") or [] if isinstance(failed, dict)]
+        if any(isinstance(cause, dict) and cause.get("type") == RESTORING_ERROR_TYPE for cause in causes):
+            return True
+    return "currently being restored from a snapshot" in str(exc)
+
+
 def _is_not_ready(exc):
     """True while a restored index is still being created / allocated.
 
     That is a 404 or 503, or a 403 ``shard_restoring_exception`` ("currently being restored from a
     snapshot and is temporarily unavailable"). Other 403s are real permission errors and are not retried.
     """
-    return _status(exc) in TRANSIENT_STATUSES or "shard_restoring_exception" in str(exc)
+    return _status(exc) in TRANSIENT_STATUSES or _is_restoring_error(exc)
 
 
 def _parse_ts(value):
@@ -71,7 +103,10 @@ def _utcnow():
 
 
 def _report(message):
-    """Show a result on the console and in the Rally log (not kept by the in-memory metrics store)."""
+    """Report a result in the Rally log (not kept by the in-memory metrics store).
+
+    Runners execute in a worker process, so the console output does not reach the terminal there.
+    """
     console.info(message)
     logger.info(message)
 
@@ -79,26 +114,29 @@ def _report(message):
 _UNSAFE_NAME = re.compile(r"[*?,/\\\s]")
 
 
-def _require_plain_index_name(name):
-    """Refuse anything that could make a DELETE hit more than the single index this track created.
+def _require_plain_name(name, kind):
+    """Refuse a name that could change which resource a request addresses.
 
     Rejects empty names, wildcards, lists, whitespace, path characters, and names starting with
     ``_``, ``-``, ``+`` or ``.`` (which also covers ``_all`` and system indices).
     """
     if not isinstance(name, str) or not name or _UNSAFE_NAME.search(name) or name[0] in "_-+.":
         raise ValueError(
-            f"[{name}] is not a plain index name: wildcards, lists, whitespace and names starting with _ - + . are not allowed"
+            f"[{name}] is not a plain {kind} name: wildcards, lists, whitespace and names starting with _ - + . are not allowed"
         )
     return name
+
+
+def _require_plain_index_name(name):
+    """Refuse anything that could make a DELETE hit more than the single index this track created."""
+    return _require_plain_name(name, "index")
 
 
 class DataRecoveryClient:
     """Single place for all data recovery API calls.
 
-    Calls the Elasticsearch-side ``_data_recovery`` APIs directly (``points``,
-    ``sources``, ``recoveries``) with the operator credentials esbench passes to
-    Rally. The control-plane (project-api) equivalents are incomplete and Rally has
-    no control-plane credentials, so they are not used. Callers must only go
+    Calls the Elasticsearch ``_data_recovery`` APIs directly (``points``, ``sources``,
+    ``recoveries``) with the credentials Rally is configured with. Callers must only go
     through this class so the backing API can change later.
     """
 
@@ -175,8 +213,25 @@ class _RunState:
 STATE = _RunState()
 
 
+def _require_state(runner, *fields):
+    """Fail clearly if an earlier task has not set the values this runner needs from ``STATE``."""
+    missing = [field for field in fields if getattr(STATE, field) is None]
+    if missing:
+        raise RuntimeError(
+            f"[{runner}] needs {', '.join(missing)} from an earlier task. "
+            "Run the restore-baseline tasks in order, each with a single client."
+        )
+
+
 class _Runner:
     name = None
+    # Params the challenge definition must provide; it is the single source of defaults.
+    required_params = ()
+
+    def _require_params(self, params):
+        missing = [key for key in self.required_params if key not in params]
+        if missing:
+            raise KeyError(f"missing required param(s) {missing}; they are set in the challenge definition")
 
     def __repr__(self, *args, **kwargs):
         return self.name
@@ -192,12 +247,26 @@ class DataRecoveryPreflight(_Runner):
 
 
 class IndexSourceDocs(_Runner):
+    """Create the source index and load it with generated docs.
+
+    TEMPORARY: generating our own docs is only a stand-in to get a working end-to-end restore for
+    now. The next iteration will load an existing Rally corpus (for example geonames) with Rally's
+    own bulk operation instead, and replace this runner with one that only records the expected doc
+    count and checksum of the loaded source index.
+    """
+
     name = "index-source-docs"
+    required_params = ("index", "doc_count", "bulk_size", "validate_restore")
 
     async def __call__(self, es, params):
+        self._require_params(params)
         index = _require_plain_index_name(params["index"])
-        doc_count = int(params.get("doc_count", 100))
-        bulk_size = int(params.get("bulk_size", 1000))
+        doc_count = int(params["doc_count"])
+        bulk_size = int(params["bulk_size"])
+        if doc_count < 1:
+            raise ValueError(f"doc_count must be at least 1, got [{doc_count}]")
+        if bulk_size < 1:
+            raise ValueError(f"bulk_size must be at least 1, got [{bulk_size}]")
 
         try:
             await es.perform_request(method="DELETE", path=f"/{index}")
@@ -210,7 +279,7 @@ class IndexSourceDocs(_Runner):
             lines = []
             for n in range(start, min(start + bulk_size, doc_count)):
                 lines.append(json.dumps({"index": {}}))
-                lines.append(json.dumps({"n": n, "message": f"doc {n}"}))
+                lines.append(json.dumps({CHECKSUM_FIELD: n, "message": f"doc {n}"}))
             response = await es.perform_request(
                 method="POST",
                 path=f"/{index}/_bulk",
@@ -230,24 +299,27 @@ class IndexSourceDocs(_Runner):
         if indexed != doc_count:
             raise RuntimeError(f"[{index}] holds {indexed} docs after indexing, expected {doc_count}")
         STATE.expected_docs = indexed
-        STATE.expected_checksum = await client.sum_field(index, "n") if params.get("validate_restore", True) else None
+        STATE.expected_checksum = await client.sum_field(index, CHECKSUM_FIELD) if params["validate_restore"] else None
         return {"weight": doc_count, "unit": "docs", "source_index": index}
 
 
 class WaitForRecoveryPoint(_Runner):
     name = "wait-for-recovery-point"
+    required_params = ("recovery_point_mode", "recovery_repo", "timeout_secs", "poll_interval_secs")
 
     async def __call__(self, es, params):
-        mode = params.get("recovery_point_mode", "wait")
-        timeout = float(params.get("timeout_secs", 2400))
-        interval = float(params.get("poll_interval_secs", 10))
+        self._require_params(params)
+        _require_state(self.name, "source_index", "indexed_at")
+        mode = params["recovery_point_mode"]
+        timeout = float(params["timeout_secs"])
+        interval = float(params["poll_interval_secs"])
         client = DataRecoveryClient(es)
         started = time.monotonic()
 
         # Snapshots are left in place: the track never deletes them.
         snapshot_name = None
         if mode == "snapshot":
-            repository = params.get("recovery_repo", "data-recovery")
+            repository = _require_plain_name(params["recovery_repo"], "repository")
             snapshot_name = f"rally-{uuid.uuid4().hex[:8]}"
             await client.create_snapshot(repository, snapshot_name, STATE.source_index)
         elif mode != "wait":
@@ -292,13 +364,16 @@ class RestoreRecovery(_Runner):
     """
 
     name = "restore-recovery"
+    required_params = ("restore_prefix", "timeout_secs", "poll_interval_secs", "use_status_api")
 
     async def __call__(self, es, params):
-        timeout = float(params.get("timeout_secs", 600))
-        interval = float(params.get("poll_interval_secs", 2))
-        use_status_api = bool(params.get("use_status_api", False))
+        self._require_params(params)
+        _require_state(self.name, "source_index", "expected_docs", "recovery_point_end_time", "recovery_point_wait_secs")
+        timeout = float(params["timeout_secs"])
+        interval = float(params["poll_interval_secs"])
+        use_status_api = bool(params["use_status_api"])
         # Unique per run so restores never collide and cleanup can target them.
-        prefix = f"{params.get('restore_prefix', 'rally-restore-')}{uuid.uuid4().hex[:6]}-"
+        prefix = f"{params['restore_prefix']}{uuid.uuid4().hex[:6]}-"
         client = DataRecoveryClient(es)
 
         started = time.monotonic()
@@ -306,9 +381,10 @@ class RestoreRecovery(_Runner):
         STATE.recovery_id = body["recovery_id"]
         STATE.destination = body["resolved_sources"][0]["destination"]
 
+        # One timeout covers the whole restore, whichever way completion is detected.
         if use_status_api:
-            await self._wait_with_status_api(client, timeout, interval)
-        restored_docs = await self._wait_for_docs(client, timeout, interval)
+            await self._wait_with_status_api(client, started, timeout, interval)
+        restored_docs = await self._wait_for_docs(client, started, timeout, interval)
         restore_duration = time.monotonic() - started
         primary_shards = await client.primary_shard_count(STATE.destination)
 
@@ -330,8 +406,8 @@ class RestoreRecovery(_Runner):
         }
 
     @staticmethod
-    async def _wait_with_status_api(client, timeout, interval):
-        deadline = time.monotonic() + timeout
+    async def _wait_with_status_api(client, started, timeout, interval):
+        deadline = started + timeout
         while True:
             status = (await client.get_recovery(STATE.recovery_id)).get("status")
             if status == "completed":
@@ -343,9 +419,12 @@ class RestoreRecovery(_Runner):
             await asyncio.sleep(interval)
 
     @staticmethod
-    async def _wait_for_docs(client, timeout, interval):
-        """Poll the restored index until it holds every source doc; 404/503 mean it is not ready yet."""
-        deadline = time.monotonic() + timeout
+    async def _wait_for_docs(client, started, timeout, interval):
+        """Poll the restored index until it holds every source doc.
+
+        A 404, a 503 or a ``shard_restoring_exception`` 403 mean it is not ready yet (see ``_is_not_ready``).
+        """
+        deadline = started + timeout
         last = None
         while True:
             try:
@@ -377,13 +456,14 @@ class ValidateRestore(_Runner):
     name = "validate-restore"
 
     async def __call__(self, es, params):
+        _require_state(self.name, "source_index", "destination", "expected_docs", "expected_checksum")
         client = DataRecoveryClient(es)
         restored_docs = await client.count(STATE.destination)
         if restored_docs != STATE.expected_docs:
             raise RuntimeError(
                 f"validation failed: [{STATE.destination}] has {restored_docs} docs, source [{STATE.source_index}] had {STATE.expected_docs}"
             )
-        restored_checksum = await client.sum_field(STATE.destination, "n")
+        restored_checksum = await client.sum_field(STATE.destination, CHECKSUM_FIELD)
         if restored_checksum != STATE.expected_checksum:
             raise RuntimeError(
                 f"validation failed: [{STATE.destination}] content checksum {restored_checksum} differs from "
@@ -419,13 +499,6 @@ class CleanupRecovery(_Runner):
                 raise
 
 
-class MeasureClusterState(_Runner):
-    name = "measure-cluster-state"
-
-    async def __call__(self, es, params):
-        raise NotImplementedError(f"{self.name} is not implemented yet")
-
-
 def register(registry):
     for runner in (
         DataRecoveryPreflight,
@@ -434,6 +507,5 @@ def register(registry):
         RestoreRecovery,
         ValidateRestore,
         CleanupRecovery,
-        MeasureClusterState,
     ):
         registry.register_runner(runner.name, runner(), async_runner=True)

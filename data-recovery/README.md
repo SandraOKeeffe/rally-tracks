@@ -1,24 +1,19 @@
-# snapshot-recovery track
+# data-recovery track
 
-Benchmarks Serverless **data recovery** restores and checks how restores affect cluster state.
-
-Status: `restore-baseline` is implemented (MVP). The other challenges and `measure-cluster-state` are still stubs.
+Benchmarks Serverless **data recovery** restores.
 
 ## Goals
 
-* Measure restore duration at normal size and at platform limits.
-* Verify that restores change cluster state no differently from normal index creation (linear growth).
+* Measure restore duration at normal size, and later at platform limits.
+* Later: verify that restores change cluster state no differently from normal index creation (linear growth).
 
 ## Challenges
 
-| Challenge | Status | Purpose |
-| --- | --- | --- |
-| `restore-baseline` | implemented | Index a small source index, obtain a recovery point, restore it (`mode: rename`) and verify the restored doc count. |
-| `max-shard-size` | stub | Restore sources whose shards are at the platform maximum size. |
-| `max-shards-per-node` | stub | Restore enough shards to reach the per-node shard limit. |
-| `max-concurrent-restores` | stub | Run restores in parallel up to the concurrent-restore limit. |
-| `max-concurrent-restores-many-shards` | stub | Maximum concurrent restores with many shards each; exercises the cluster state limit. |
-| `restore-cluster-state` | stub | Stepped restore comparing cluster state growth against creating equivalent indices directly. |
+| Challenge | Purpose |
+| --- | --- |
+| `restore-baseline` | Index a small source index, obtain a recovery point, restore it (`mode: rename`) and validate the restored index against the source. |
+
+Challenges for the platform limits and for cluster state growth will be added once they are agreed.
 
 ## `restore-baseline`
 
@@ -35,23 +30,13 @@ Results: Rally's own timing for each task (`race.json`), where `restore-recovery
 
 All recovery API calls go through `DataRecoveryClient` in `track.py` and use the Elasticsearch-side `_data_recovery` APIs. The runners share state through a module-level object, so each operation must run with a single client.
 
-## Running locally
-
-Point Rally at a local Serverless Elasticsearch with `_data_recovery` enabled, with operator credentials:
-
-```
-esrally race --track-path=<path>/snapshot-recovery --challenge=restore-baseline \
-  --pipeline=benchmark-only --target-hosts=localhost:9200 \
-  --client-options=<client-options-file> --track-params="recovery_point_mode:snapshot"
-```
-
 ## Track parameters
 
 | Setting | Default | Description |
 | --- | --- | --- |
 | `source_index` | `recovery-source` | Name of the source index. It is deleted and recreated. |
-| `doc_count` | `100` | Number of generated docs to index. |
-| `bulk_size` | `1000` | Bulk request size. |
+| `doc_count` | `100` | Number of generated docs to index (at least 1). |
+| `bulk_size` | `1000` | Bulk request size (at least 1). |
 | `recovery_point_mode` | `wait` | `wait` for automatic points, `snapshot` to create one via a snapshot (local only). |
 | `recovery_repo` | `data-recovery` | Snapshot repository used in `snapshot` mode (the repository name on QA). A local cluster may use a different name, e.g. `recovery_repo:recovery-repo`. |
 | `recovery_point_timeout_secs` | `2400` | How long to wait for a usable recovery point. |
@@ -62,8 +47,5 @@ esrally race --track-path=<path>/snapshot-recovery --challenge=restore-baseline 
 | `use_status_api` | `false` | Also wait on the recovery status API (under development). |
 | `validate_restore` | `true` | Run the content checksum comparison between the source and the restored index. |
 | `cleanup` | `true` | Delete the restored and source indices at the end. Snapshots are never deleted. |
-| `fail_on_recovery_failure` | `true` | Reserved for the other challenges. |
-| `state_tolerance` | `0.1` | Reserved for `restore-cluster-state`. |
-| `step_size` | `10` | Reserved for `restore-cluster-state`. |
-| `max_sources` | `100` | Reserved for `restore-cluster-state`. |
-| `recovery_point_max_age_minutes` | `60` | Reserved, currently unused. |
+
+The defaults are defined in `challenges/restore-baseline.json`. The runners require their params and do not repeat the defaults, and a unit test checks that this table matches the challenge definition.
