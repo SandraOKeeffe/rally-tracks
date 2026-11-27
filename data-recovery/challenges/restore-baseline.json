@@ -1,6 +1,6 @@
 {
   "name": "restore-baseline",
-  "description": "Load a Rally corpus into a source index, obtain a recovery point, restore it with mode rename and validate the restored index against the source",
+  "description": "Load a Rally corpus into a source index or data stream, obtain a recovery point, restore it with mode rename and validate the restored index against the source",
   "default": true,
   "schedule": [
     {
@@ -14,13 +14,13 @@
     {
       "name": "delete-source",
       "operation": {
-        "operation-type": "delete-index"
+        "operation-type": "{{ 'delete-data-stream' if p_is_data_stream else 'delete-index' }}"
       }
     },
     {
       "name": "create-source",
       "operation": {
-        "operation-type": "create-index"
+        "operation-type": "{{ 'create-data-stream' if p_is_data_stream else 'create-index' }}"
       }
     },
     {
@@ -45,6 +45,7 @@
       "operation": {
         "operation-type": "record-source",
         "index": "{{ p_source.target }}",
+        "target_type": "{{ p_source.target_type }}",
         "checksum_field": {{ (p_source.checksum_field if validate_restore | default(true) else none) | tojson }}
       }
     },

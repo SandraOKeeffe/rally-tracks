@@ -1,0 +1,12 @@
+{
+  "name": "endpoint_file",
+  "base-url": "https://rally-tracks.elastic.co/data/security/7.16",
+  "documents": [
+    {
+      "target-data-stream": "logs-endpoint.events.file-default",
+      "source-file": "logs-endpoint.events.file-default-documents.json.bz2",
+      "document-count": 4315173,
+      "compressed-bytes": 350796549
+    }
+  ]
+}

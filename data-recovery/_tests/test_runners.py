@@ -127,6 +127,11 @@ def fresh_state(monkeypatch):
     track.STATE.reset()
 
 
+def _millis(offset_secs):
+    base = datetime(2026, 11, 13, 12, 0, 0, tzinfo=timezone.utc)
+    return int((base + timedelta(seconds=offset_secs)).timestamp() * 1000)
+
+
 def _ts(offset_secs):
     base = datetime(2026, 11, 13, 12, 0, 0, tzinfo=timezone.utc)
     return (base + timedelta(seconds=offset_secs)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -136,15 +141,16 @@ def _point(start, end):
     return {"start_time": _ts(start), "end_time": _ts(end)}
 
 
-def _set_indexed(index="src", docs=3, at=0):
+def _set_indexed(index="src", docs=3, at=0, source_type="index"):
     track.STATE.source_index = index
+    track.STATE.source_type = source_type
     track.STATE.expected_docs = docs
     track.STATE.indexed_at = datetime(2026, 11, 13, 12, 0, 0, tzinfo=timezone.utc) + timedelta(seconds=at)
 
 
 # The runners require every param (the challenge definition is the single source of defaults).
 PREFLIGHT_PARAMS = {"source_index": "src", "restore_prefix": "rally-restore-"}
-RECORD_PARAMS = {"index": "src", "checksum_field": "n"}
+RECORD_PARAMS = {"index": "src", "target_type": "index", "checksum_field": "n"}
 WAIT_PARAMS = {"recovery_point_mode": "wait", "recovery_repo": "data-recovery", "timeout_secs": 100, "poll_interval_secs": 0}
 RESTORE_PARAMS = {"restore_prefix": "rally-restore-", "timeout_secs": 100, "poll_interval_secs": 0, "use_status_api": False}
 
@@ -219,7 +225,7 @@ async def test_wait_for_recovery_point_snapshot_mode_creates_snapshot():
 
     def handler(method, path, params, body):
         if method == "PUT":
-            return {"snapshot": {}}
+            return {"snapshot": {"start_time_in_millis": _millis(5)}}
         if path == "/_data_recovery/points":
             return {"recovery_points": [_point(5, 6)]}
         return {"sources": [{"name": "src", "complete": True}]}
@@ -230,6 +236,26 @@ async def test_wait_for_recovery_point_snapshot_mode_creates_snapshot():
     assert put[1].startswith("/_snapshot/my-repo/rally-")
     assert put[3] == {"indices": "src", "include_global_state": False}
     assert result["snapshot"] == put[1].rsplit("/", 1)[1]
+    assert result["recovery_point_end_time"] == _ts(6)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_recovery_point_snapshot_mode_uses_the_snapshot_start_not_the_local_clock():
+    # The cluster's clock is behind this host's: the point of the snapshot taken after indexing starts
+    # "before" indexed_at by the local clock, and must still be used. Older points stay excluded.
+    _set_indexed(at=10)
+
+    def handler(method, path, params, body):
+        if method == "PUT":
+            return {"snapshot": {"start_time_in_millis": _millis(9.9)}}
+        if path == "/_data_recovery/points":
+            return {"recovery_points": [_point(9.9, 9.9), _point(2, 3)]}
+        return {"sources": [{"name": "src", "complete": True}]}
+
+    result = await track.WaitForRecoveryPoint()(
+        FakeEs(handler), {**WAIT_PARAMS, "recovery_point_mode": "snapshot", "recovery_repo": "my-repo"}
+    )
+    assert result["recovery_point_end_time"] == _ts(9.9)
 
 
 @pytest.mark.asyncio
@@ -273,8 +299,11 @@ def _restore_handler(on_other):
 
     def handler(method, path, params, body):
         if method == "POST" and path == "/_data_recovery/recoveries":
-            prefix = body["rename_strategy"]["prefix"]
-            return {"recovery_id": "id1", "resolved_sources": [{"source": "src", "destination": prefix + "src"}]}
+            source = body["sources"][0]
+            strategy = body["rename_strategy"]
+            destination = strategy.get("prefix", "") + source + strategy.get("suffix", "")
+            source_type = track.STATE.source_type
+            return {"recovery_id": "id1", "resolved_sources": [{"source": source, "type": source_type, "destination": destination}]}
         return on_other(method, path, params, body)
 
     return handler
@@ -474,6 +503,43 @@ async def test_preflight_refuses_unsafe_source_index_without_calling_es(name):
 
 
 @pytest.mark.asyncio
+async def test_restore_recovery_renames_a_data_stream_with_a_suffix():
+    _set_recovery_point()
+    track.STATE.source_index = "logs-benchmark-dev"
+    track.STATE.source_type = "data_stream"
+    es = FakeEs(_restore_handler(lambda *a: _count_body(3)))
+    await track.RestoreRecovery()(es, RESTORE_PARAMS)
+
+    start = next(c for c in es.calls if c[0] == "POST")
+    assert set(start[3]["rename_strategy"]) == {"suffix"}
+    assert start[3]["rename_strategy"]["suffix"].startswith("-rally-restore-")
+    # The restored data stream keeps the source's name in front, so it matches the same templates (logs-*-*).
+    assert track.STATE.destination.startswith("logs-benchmark-dev-rally-restore-")
+    assert es.calls[-1][1] == f"/{track.STATE.destination}/_count"
+
+
+@pytest.mark.asyncio
+async def test_restore_recovery_renames_an_index_with_a_prefix():
+    _set_recovery_point()
+    es = FakeEs(_restore_handler(lambda *a: _count_body(3)))
+    await track.RestoreRecovery()(es, RESTORE_PARAMS)
+    start = next(c for c in es.calls if c[0] == "POST")
+    assert set(start[3]["rename_strategy"]) == {"prefix"}
+    assert track.STATE.destination.startswith("rally-restore-") and track.STATE.destination.endswith("-src")
+
+
+@pytest.mark.asyncio
+async def test_restore_recovery_fails_when_the_source_resolves_as_another_type():
+    _set_recovery_point()
+
+    def handler(method, path, params, body):
+        return {"recovery_id": "id1", "resolved_sources": [{"source": "src", "type": "data_stream", "destination": "x-src"}]}
+
+    with pytest.raises(RuntimeError, match=r"resolved as a \[data_stream\], expected a \[index\]"):
+        await track.RestoreRecovery()(FakeEs(handler), RESTORE_PARAMS)
+
+
+@pytest.mark.asyncio
 async def test_restore_recovery_status_api_failed():
     _set_recovery_point()
 
@@ -530,6 +596,18 @@ async def test_cleanup_deletes_both_indices_ignores_missing_and_never_deletes_sn
     assert not any("_snapshot" in call[1] for call in es.calls)
 
 
+@pytest.mark.asyncio
+async def test_cleanup_deletes_data_streams_with_the_data_stream_api():
+    _set_indexed(index="logs-benchmark-dev", source_type="data_stream")
+    track.STATE.destination = "logs-benchmark-dev-rally-restore-abc123"
+    es = FakeEs(lambda *a: {})
+    await track.CleanupRecovery()(es, {})
+    assert [c[:2] for c in es.calls] == [
+        ("DELETE", "/_data_stream/logs-benchmark-dev-rally-restore-abc123"),
+        ("DELETE", "/_data_stream/logs-benchmark-dev"),
+    ]
+
+
 UNSAFE_NAMES = [
     "*",
     "recovery-*",
@@ -574,10 +652,18 @@ def test_plain_index_names_are_accepted():
         assert track._require_plain_index_name(name) == name
 
 
-def _source_handler(count=5, checksum=10.0):
+def _field_caps(*field_types, field="n"):
+    """A ``_field_caps`` response: one entry per type the field is mapped as across the target's indices."""
+    return {"indices": ["x"], "fields": {field: {ft: {"type": ft} for ft in field_types}} if field_types else {}}
+
+
+def _source_handler(count=5, checksum=10.0, field_type="long"):
     def handler(method, path, params, body):
         if path.endswith("/_count"):
             return {"count": count}
+        if path.endswith("/_field_caps"):
+            assert params == {"fields": "n"}
+            return _field_caps(field_type) if field_type else _field_caps()
         if path.endswith("/_search"):
             assert body["aggs"]["total"]["sum"]["field"] == "n"
             return {"aggregations": {"total": {"value": checksum}}}
@@ -606,6 +692,52 @@ async def test_record_source_without_checksum_field_only_counts():
     assert track.STATE.checksum_field is None
     assert track.STATE.expected_checksum is None
     assert not any(c[1].endswith("/_search") for c in es.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field_type", ["double", "float", "scaled_float", "keyword", None])
+async def test_record_source_refuses_a_checksum_field_that_is_not_an_integer(field_type):
+    with pytest.raises(RuntimeError, match="checksum field \\[n\\]"):
+        await track.RecordSource()(FakeEs(_source_handler(field_type=field_type)), RECORD_PARAMS)
+    assert track.STATE.source_index is None
+
+
+@pytest.mark.asyncio
+async def test_record_source_checks_the_field_across_every_backing_index():
+    def handler(method, path, params, body):
+        if path.endswith("/_field_caps"):
+            return _field_caps("long", "double", field="metrics.size")
+        return {"count": 5}
+
+    with pytest.raises(RuntimeError, match="double"):
+        await track.RecordSource()(FakeEs(handler), {**RECORD_PARAMS, "target_type": "data_stream", "checksum_field": "metrics.size"})
+
+
+@pytest.mark.asyncio
+async def test_record_source_records_a_data_stream():
+    def handler(method, path, params, body):
+        if path.endswith("/_field_caps"):
+            return _field_caps("long", field="metrics.size")
+        if path.endswith("/_search"):
+            return {"aggregations": {"total": {"value": 42.0}}}
+        return {"count": 5}
+
+    params = {"index": "logs-benchmark-dev", "target_type": "data_stream", "checksum_field": "metrics.size"}
+    es = FakeEs(handler)
+    result = await track.RecordSource()(es, params)
+    assert result["source_type"] == "data_stream"
+    assert track.STATE.source_type == "data_stream"
+    assert track.STATE.expected_checksum == 42.0
+    assert ("GET", "/logs-benchmark-dev/_field_caps", {"fields": "metrics.size"}, None) in es.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_type", ["alias", "", "Index"])
+async def test_record_source_refuses_unknown_target_types_without_calling_es(target_type):
+    es = FakeEs(_source_handler())
+    with pytest.raises(ValueError, match="target_type"):
+        await track.RecordSource()(es, {**RECORD_PARAMS, "target_type": target_type})
+    assert es.calls == []
 
 
 @pytest.mark.asyncio

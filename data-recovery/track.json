@@ -1,22 +1,34 @@
-{#- Per-corpus settings, picked with the corpus track param. Each corpus also needs corpora/<name>.json and
-    mappings/<name>.json, both copied from elastic/rally-tracks (see README.md).
+{#- Per-corpus settings, picked with the corpus track param. Each corpus needs corpora/<name>.json copied from
+    elastic/rally-tracks; an index corpus also needs mappings/<name>.json (see README.md). A data stream corpus
+    gets its mappings from the built-in index templates that match its name.
     These are set before importing rally.helpers so the challenge files that rally.collect includes can see them. -#}
 {% set p_corpus = corpus | default("geonames") -%}
 {% set corpus_config = {
-  "geonames": {"target": "geonames", "checksum_field": "population"},
-  "nyc_taxis": {"target": "nyc_taxis", "checksum_field": "passenger_count"}
+  "geonames": {"target": "geonames", "target_type": "index", "checksum_field": "population"},
+  "nyc_taxis": {"target": "nyc_taxis", "target_type": "index", "checksum_field": "passenger_count"},
+  "big5": {"target": "logs-benchmark-dev", "target_type": "data_stream", "checksum_field": "metrics.size"},
+  "endpoint_file": {"target": "logs-endpoint.events.file-default", "target_type": "data_stream", "checksum_field": "event.sequence"}
 } -%}
 {% set p_source = corpus_config[p_corpus] -%}
+{% set p_is_data_stream = p_source.target_type == "data_stream" -%}
 {% import "rally.helpers" as rally with context -%}
 {
   "version": 2,
-  "description": "Benchmarks Serverless data recovery restores: loads a Rally corpus into a source index, restores it with the _data_recovery APIs and validates the restored index against the source. Track params and their defaults are documented in README.md and defined in track.json and challenges/restore-baseline.json.",
+  "description": "Benchmarks Serverless data recovery restores: loads a Rally corpus into a source index or data stream, restores it with the _data_recovery APIs and validates the restored copy against the source. Track params and their defaults are documented in README.md and defined in track.json and challenges/restore-baseline.json.",
+  {% if p_is_data_stream -%}
+  "data-streams": [
+    {
+      "name": "{{ p_source.target }}"
+    }
+  ],
+  {%- else -%}
   "indices": [
     {
       "name": "{{ p_source.target }}",
       "body": "mappings/{{ p_corpus }}.json"
     }
   ],
+  {%- endif %}
   "corpora": [
     {% include "corpora/" ~ p_corpus ~ ".json" %}
   ],

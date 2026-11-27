@@ -1,9 +1,9 @@
 """Serverless data recovery restore track.
 
 The ``restore-baseline`` challenge loads a Rally corpus (picked with the ``corpus`` track param) into a
-source index with Rally's own bulk operation, obtains a recovery point (created via a snapshot locally, or
-waited for on a real deployment), restores it with ``mode: rename`` and validates the restored index
-against the source.
+source index or data stream with Rally's own bulk operation, obtains a recovery point (created via a
+snapshot locally, or waited for on a real deployment), restores it with ``mode: rename`` and validates
+the restored copy against the source.
 
 Defaults live in the challenge definition only: the runners require their params (see
 ``required_params``) and fail with a clear message if one is missing.
@@ -27,6 +27,12 @@ logger = logging.getLogger(__name__)
 
 # Statuses returned while a restored index is still being created / allocated.
 TRANSIENT_STATUSES = (404, 503)
+
+# What a corpus loads into, as named in ``corpus_config`` in track.json and in ``resolved_sources``.
+TARGET_TYPES = ("index", "data_stream")
+
+# Field types whose sum is exact, so it can be compared between the source and the restored copy.
+INTEGER_FIELD_TYPES = ("long", "integer", "short", "byte")
 
 
 def _unwrap(response):
@@ -168,6 +174,14 @@ class DataRecoveryClient:
         body = await self._request("GET", f"/{index}/_count")
         return body["count"], body["_shards"]["total"], body["_shards"]["failed"]
 
+    async def field_types(self, target, field):
+        """Mapped types of a field across the indices behind ``target`` (an index or a data stream).
+
+        Uses field capabilities, since the field mapping API is not available on Serverless.
+        """
+        body = await self._request("GET", f"/{target}/_field_caps", params={"fields": field})
+        return set((body.get("fields") or {}).get(field, {}))
+
     async def sum_field(self, index, field):
         """Sum of a numeric field, used as a cheap content checksum."""
         body = {"size": 0, "aggs": {"total": {"sum": {"field": field}}}}
@@ -184,6 +198,7 @@ class _RunState:
     def reset(self):
         self.source_index = None
         self.expected_docs = None
+        self.source_type = None
         self.checksum_field = None
         self.expected_checksum = None
         self.indexed_at = None
@@ -237,36 +252,53 @@ class DataRecoveryPreflight(_Runner):
 class RecordSource(_Runner):
     """Record what the restore is checked against, once Rally's bulk task has loaded the source.
 
-    The expected doc count is read back from the source index rather than taken from the corpus, so
-    it stays right with ``ingest_percentage`` and with bulk items Rally reported as errors.
-    ``checksum_field`` is the corpus's integer field whose sum is compared after the restore (a sum
-    over floating point values can differ with summation order); without one only the doc count is
-    validated.
+    The source is an index or a data stream (``target_type``). The expected doc count is read back from
+    it rather than taken from the corpus, so it stays right with ``ingest_percentage`` and with bulk
+    items Rally reported as errors. ``checksum_field`` is the corpus's integer field whose sum is
+    compared after the restore (a sum over floating point values can differ with summation order); its
+    mapped type is checked here, since a data stream corpus gets its mapping from the cluster's
+    templates. Without one only the doc count is validated.
     """
 
     name = "record-source"
-    required_params = ("index", "checksum_field")
+    required_params = ("index", "target_type", "checksum_field")
 
     async def __call__(self, es, params):
         self._require_params(params)
         index = _require_plain_index_name(params["index"])
+        target_type = params["target_type"]
+        if target_type not in TARGET_TYPES:
+            raise ValueError(f"target_type must be one of {list(TARGET_TYPES)}, got [{target_type}]")
         checksum_field = params["checksum_field"]
+        if checksum_field is not None:
+            _require_plain_name(checksum_field, "field")
         client = DataRecoveryClient(es)
 
         docs = await client.count(index)
         if docs < 1:
             raise RuntimeError(f"[{index}] holds no docs after loading the corpus")
+        expected_checksum = None
+        if checksum_field:
+            types = await client.field_types(index, checksum_field)
+            if not types or not types <= set(INTEGER_FIELD_TYPES):
+                raise RuntimeError(
+                    f"checksum field [{checksum_field}] of [{index}] is mapped as {sorted(types) or 'nothing'}, "
+                    f"expected one of {list(INTEGER_FIELD_TYPES)}"
+                )
+            expected_checksum = await client.sum_field(index, checksum_field)
+
         STATE.source_index = index
+        STATE.source_type = target_type
         STATE.expected_docs = docs
         STATE.checksum_field = checksum_field
-        STATE.expected_checksum = await client.sum_field(index, checksum_field) if checksum_field else None
+        STATE.expected_checksum = expected_checksum
         # Recovery points must start after this to contain every doc.
         STATE.indexed_at = _utcnow()
         _report(
-            f"Source [{index}] holds {docs} docs"
-            + (f", checksum of [{checksum_field}] {STATE.expected_checksum}" if checksum_field else "")
+            f"Source {target_type} [{index}] holds {docs} docs"
+            + (f", checksum of [{checksum_field}] {expected_checksum}" if checksum_field else "")
         )
-        return {"weight": 1, "unit": "ops", "source_index": index, "source_docs": docs}
+        return {"weight": 1, "unit": "ops", "source_index": index, "source_type": target_type, "source_docs": docs}
 
 
 class WaitForRecoveryPoint(_Runner):
@@ -284,15 +316,20 @@ class WaitForRecoveryPoint(_Runner):
 
         # Snapshots are left in place: the track never deletes them.
         snapshot_name = None
+        # Earliest start time a usable point can have. In wait mode that is when the source was recorded, by
+        # this host's clock. In snapshot mode it is the start of the snapshot taken here, by the cluster's
+        # clock: it can be only milliseconds after recording, less than the two clocks can differ.
+        not_before = STATE.indexed_at
         if mode == "snapshot":
             repository = _require_plain_name(params["recovery_repo"], "repository")
             snapshot_name = f"rally-{uuid.uuid4().hex[:8]}"
-            await client.create_snapshot(repository, snapshot_name, STATE.source_index)
+            body = await client.create_snapshot(repository, snapshot_name, STATE.source_index)
+            not_before = datetime.fromtimestamp(body["snapshot"]["start_time_in_millis"] / 1000, timezone.utc)
         elif mode != "wait":
             raise ValueError(f"recovery_point_mode must be 'wait' or 'snapshot', got [{mode}]")
 
         while True:
-            point = await self._usable_point(client)
+            point = await self._usable_point(client, not_before)
             if point is not None:
                 break
             if time.monotonic() - started > timeout:
@@ -310,10 +347,10 @@ class WaitForRecoveryPoint(_Runner):
         }
 
     @staticmethod
-    async def _usable_point(client):
-        """Earliest recovery point that started after indexing finished and has the source complete."""
+    async def _usable_point(client, not_before):
+        """Earliest recovery point that started at or after ``not_before`` and has the source complete."""
         points = await client.list_recovery_points()
-        candidates = [p for p in points if _parse_ts(p["start_time"]) > STATE.indexed_at]
+        candidates = [p for p in points if _parse_ts(p["start_time"]) >= not_before]
         for point in sorted(candidates, key=lambda p: _parse_ts(p["start_time"])):
             body = await client.list_sources(point["end_time"], STATE.source_index)
             sources = body.get("sources", [])
@@ -334,20 +371,24 @@ class RestoreRecovery(_Runner):
 
     async def __call__(self, es, params):
         self._require_params(params)
-        _require_state(self.name, "source_index", "expected_docs", "recovery_point_end_time", "recovery_point_wait_secs")
+        _require_state(self.name, "source_index", "source_type", "expected_docs", "recovery_point_end_time", "recovery_point_wait_secs")
         timeout = float(params["timeout_secs"])
         interval = float(params["poll_interval_secs"])
         use_status_api = bool(params["use_status_api"])
         # Unique per run so restores never collide and cleanup can target them.
-        prefix = f"{params['restore_prefix']}{uuid.uuid4().hex[:6]}-"
+        tag = f"{params['restore_prefix']}{uuid.uuid4().hex[:6]}"
+        prefix, suffix = self._rename(tag)
         # Cleanup refuses names that are not plain, so check the name the restore will create before starting it.
-        _require_plain_index_name(f"{prefix}{STATE.source_index}")
+        _require_plain_index_name(f"{prefix or ''}{STATE.source_index}{suffix or ''}")
         client = DataRecoveryClient(es)
 
         started = time.monotonic()
-        body = await client.start_recovery(STATE.recovery_point_end_time, [STATE.source_index], mode="rename", prefix=prefix)
+        body = await client.start_recovery(STATE.recovery_point_end_time, [STATE.source_index], mode="rename", prefix=prefix, suffix=suffix)
         STATE.recovery_id = body["recovery_id"]
-        STATE.destination = _require_plain_index_name(body["resolved_sources"][0]["destination"])
+        resolved = body["resolved_sources"][0]
+        if resolved.get("type", STATE.source_type) != STATE.source_type:
+            raise RuntimeError(f"[{STATE.source_index}] was resolved as a [{resolved['type']}], expected a [{STATE.source_type}]")
+        STATE.destination = _require_plain_index_name(resolved["destination"])
 
         # One timeout covers the whole restore, whichever way completion is detected.
         if use_status_api:
@@ -372,6 +413,18 @@ class RestoreRecovery(_Runner):
             "restored_primary_shards": primary_shards,
             "recovery_point_wait_secs": STATE.recovery_point_wait_secs,
         }
+
+    @staticmethod
+    def _rename(tag):
+        """``(prefix, suffix)`` that give the restored copy a unique name.
+
+        An index gets the tag as a prefix. A restored data stream needs an index template that matches
+        its new name (the restore is refused otherwise), so it gets the tag as a suffix instead: that
+        keeps it matching the same templates as the source, e.g. ``logs-*-*``.
+        """
+        if STATE.source_type == "data_stream":
+            return None, f"-{tag}"
+        return f"{tag}-", None
 
     @staticmethod
     async def _wait_with_status_api(client, started, timeout, interval):
@@ -463,7 +516,7 @@ class ValidateRestore(_Runner):
 
 
 class CleanupRecovery(_Runner):
-    """Delete the restored and source indices. Snapshots are never deleted.
+    """Delete the restored copy and the source (indices or data streams). Snapshots are never deleted.
 
     Left out of the schedule with ``cleanup=false``. It must not be scheduled as a no-op: Rally
     times a task from the Elasticsearch requests it makes, so a runner that makes none fails the task.
@@ -472,9 +525,11 @@ class CleanupRecovery(_Runner):
     name = "cleanup-recovery"
 
     async def __call__(self, es, params):
-        indices = [_require_plain_index_name(index) for index in (STATE.destination, STATE.source_index) if index]
-        for index in indices:
-            await self._ignore_missing(es.perform_request(method="DELETE", path=f"/{index}"))
+        names = [_require_plain_index_name(name) for name in (STATE.destination, STATE.source_index) if name]
+        # The restored copy is the same kind as its source.
+        base = "/_data_stream" if STATE.source_type == "data_stream" else ""
+        for name in names:
+            await self._ignore_missing(es.perform_request(method="DELETE", path=f"{base}/{name}"))
         return {"weight": 1, "unit": "ops", "cleaned_up": True}
 
     @staticmethod

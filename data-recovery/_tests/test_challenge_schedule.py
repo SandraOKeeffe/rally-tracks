@@ -93,33 +93,47 @@ def test_preflight_and_restore_recovery_validate_the_same_restore_prefix():
 def test_every_corpus_in_corpus_config_has_its_files():
     configured = set(re.findall(r'^\s*"(\w+)": \{"target"', TRACK_JSON.read_text(), re.MULTILINE))
     assert configured == set(CORPORA), "corpus_config in track.json and corpora/*.json must list the same corpora"
-    for name in configured:
-        assert (TRACK_DIR / "mappings" / f"{name}.json").is_file(), f"mappings/{name}.json is missing"
 
 
 @pytest.mark.parametrize("build_flavor", ["serverless", "default"])
 @pytest.mark.parametrize("corpus", CORPORA)
 def test_each_corpus_renders_a_consistent_track(corpus, build_flavor):
     rendered = _render(build_flavor=build_flavor, corpus=corpus)
-    (index,) = rendered["indices"]
     (corpus_entry,) = rendered["corpora"]
     tasks = {task["name"]: task for task in rendered["challenges"][0]["schedule"]}
-    target = index["name"]
+    target_type = tasks["record-source"]["operation"]["target_type"]
+    assert target_type in track.TARGET_TYPES
+
+    if target_type == "data_stream":
+        assert "indices" not in rendered
+        (data_stream,) = rendered["data-streams"]
+        target = data_stream["name"]
+        target_key = "target-data-stream"
+        setup = ("delete-data-stream", "create-data-stream")
+    else:
+        assert "data-streams" not in rendered
+        (index,) = rendered["indices"]
+        target = index["name"]
+        target_key = "target-index"
+        setup = ("delete-index", "create-index")
+        assert (TRACK_DIR / index["body"]).is_file(), f"{index['body']} is missing"
 
     assert corpus_entry["name"] == corpus
-    assert {doc["target-index"] for doc in corpus_entry["documents"]} == {target}
+    assert {doc.get(target_key) for doc in corpus_entry["documents"]} == {target}
     assert track._require_plain_index_name(target) == target
+    assert (tasks["delete-source"]["operation"]["operation-type"], tasks["create-source"]["operation"]["operation-type"]) == setup
     assert tasks["index-source"]["operation"]["corpora"] == corpus
     for name in ("preflight", "refresh-source", "record-source"):
         key = "source_index" if name == "preflight" else "index"
         assert tasks[name]["operation"][key] == target, f"{name} does not target [{target}]"
 
-    # The checksum is a sum compared exactly, so it needs an integer field (float sums depend on order).
-    mapping = json.loads(jinja2.Template((TRACK_DIR / index["body"]).read_text()).render(build_flavor=build_flavor))
+    # The checksum is a sum compared exactly, so it needs an integer field (float sums depend on order). A data
+    # stream's mapping comes from the cluster's templates, so record-source checks the mapped type at runtime.
     field = tasks["record-source"]["operation"]["checksum_field"]
-    if field is not None:
+    if field is not None and target_type == "index":
+        mapping = json.loads(jinja2.Template((TRACK_DIR / index["body"]).read_text()).render(build_flavor=build_flavor))
         field_type = mapping["mappings"]["properties"][field]["type"]
-        assert field_type in ("integer", "long", "short", "byte"), f"checksum field [{field}] is a {field_type}"
+        assert field_type in track.INTEGER_FIELD_TYPES, f"checksum field [{field}] is a {field_type}"
 
 
 def test_default_corpus_is_geonames():
