@@ -1,0 +1,13 @@
+{
+  "name": "nyc_taxis",
+  "base-url": "https://rally-tracks.elastic.co/nyc_taxis",
+  "documents": [
+    {
+      "target-index": "nyc_taxis",
+      "source-file": "documents.json.bz2",
+      "document-count": 165346692,
+      "compressed-bytes": 4820107188,
+      "uncompressed-bytes": 79802445255
+    }
+  ]
+}

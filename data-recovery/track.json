@@ -1,7 +1,25 @@
+{#- Per-corpus settings, picked with the corpus track param. Each corpus also needs corpora/<name>.json and
+    mappings/<name>.json, both copied from elastic/rally-tracks (see README.md).
+    These are set before importing rally.helpers so the challenge files that rally.collect includes can see them. -#}
+{% set p_corpus = corpus | default("geonames") -%}
+{% set corpus_config = {
+  "geonames": {"target": "geonames", "checksum_field": "population"},
+  "nyc_taxis": {"target": "nyc_taxis", "checksum_field": "passenger_count"}
+} -%}
+{% set p_source = corpus_config[p_corpus] -%}
 {% import "rally.helpers" as rally with context -%}
 {
   "version": 2,
-  "description": "Benchmarks Serverless data recovery restores: restores a small index with the _data_recovery APIs and validates the restored index against the source. Track params and their defaults are documented in README.md and defined in challenges/restore-baseline.json.",
+  "description": "Benchmarks Serverless data recovery restores: loads a Rally corpus into a source index, restores it with the _data_recovery APIs and validates the restored index against the source. Track params and their defaults are documented in README.md and defined in track.json and challenges/restore-baseline.json.",
+  "indices": [
+    {
+      "name": "{{ p_source.target }}",
+      "body": "mappings/{{ p_corpus }}.json"
+    }
+  ],
+  "corpora": [
+    {% include "corpora/" ~ p_corpus ~ ".json" %}
+  ],
   "challenges": [
     {{ rally.collect(parts="challenges/*.json") }}
   ]

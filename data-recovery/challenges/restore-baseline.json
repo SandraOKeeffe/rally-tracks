@@ -1,22 +1,51 @@
 {
   "name": "restore-baseline",
-  "description": "Index a small source index, obtain a recovery point, restore it with mode rename and validate the restored index against the source",
+  "description": "Load a Rally corpus into a source index, obtain a recovery point, restore it with mode rename and validate the restored index against the source",
   "default": true,
   "schedule": [
     {
       "name": "preflight",
       "operation": {
-        "operation-type": "data-recovery-preflight"
+        "operation-type": "data-recovery-preflight",
+        "source_index": "{{ p_source.target }}",
+        "restore_prefix": "{{ restore_prefix | default('rally-restore-') }}"
       }
     },
     {
-      "name": "index-source-docs",
+      "name": "delete-source",
       "operation": {
-        "operation-type": "index-source-docs",
-        "index": "{{ source_index | default('recovery-source') }}",
-        "doc_count": {{ doc_count | default(100) }},
-        "bulk_size": {{ bulk_size | default(1000) }},
-        "validate_restore": {{ validate_restore | default(true) | tojson }}
+        "operation-type": "delete-index"
+      }
+    },
+    {
+      "name": "create-source",
+      "operation": {
+        "operation-type": "create-index"
+      }
+    },
+    {
+      "name": "index-source",
+      "operation": {
+        "operation-type": "bulk",
+        "corpora": "{{ p_corpus }}",
+        "bulk-size": {{ bulk_size | default(5000) }},
+        "ingest-percentage": {{ ingest_percentage | default(100) }}
+      },
+      "clients": {{ bulk_indexing_clients | default(8) }}
+    },
+    {
+      "name": "refresh-source",
+      "operation": {
+        "operation-type": "refresh",
+        "index": "{{ p_source.target }}"
+      }
+    },
+    {
+      "name": "record-source",
+      "operation": {
+        "operation-type": "record-source",
+        "index": "{{ p_source.target }}",
+        "checksum_field": {{ (p_source.checksum_field if validate_restore | default(true) else none) | tojson }}
       }
     },
     {
